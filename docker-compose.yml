@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  # 1. Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # 2. FastAPI
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - .env
+    volumes:
+      - ./api:/app
+      - ./chroma_index:/chroma_index
+      - ./utils.py:/utils.py
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis

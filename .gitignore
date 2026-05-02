@@ -1,0 +1,13 @@
+.env
+.venv/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+chroma_index/
+keywords/*.json
+
+.DS_Store
+.vscode/
+.idea/
