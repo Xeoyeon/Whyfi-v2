@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="header">
+        WhyFi: Finance Explainer
+    </div>
+    <div class="header-description">
+        WhyFi explains complex financial terms in everyday language and provides the latest related news.
+    </div>
+
+    <div style="text-align: right; margin-bottom: 10px;">
+        <select id="langSelect" style="padding: 5px; border-radius: 5px;">
+            <option value="en" selected>English</option>
+            <option value="ko">한국어</option>
+        </select>
+    </div>
+
+    <div class="search-container">
+        <input type="text" class="search-input" id="searchTerm" placeholder="Enter a financial term...">
+        <button class="btn-search" id="searchBtn">Search</button>
+    </div>
+
+    <div class="popular-keywords">
+        <div class="section-title">
+            <span>🔥</span>
+            Trending Keywords
+        </div>
+        <div id="popularKeywords"></div>
+    </div>
+
+    <div id="result" style="display: none;">
+        <div class="section">
+            <div class="section-title">
+                <span>💡</span>
+                Explanation
+            </div>
+            <div class="explanation" id="explanation"></div>
+        </div>
+
+        <div id="trendSection" class="section">
+            <div class="section-title">
+                <span>📈</span>
+                Google Search Trend
+            </div>
+            <div class="explanation">
+                <div class="trend-summary" id="trend"></div>
+            </div>
+        </div>
+
+        <div id="newsSection" class="section">
+            <div class="section-title">
+                <span>📰</span>
+                Related News
+            </div>
+            <div id="news"></div>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+</html>

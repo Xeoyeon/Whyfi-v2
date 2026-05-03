@@ -11,3 +11,5 @@ keywords/*.json
 .DS_Store
 .vscode/
 .idea/
+
+PROJECT_STRUCTURE.md

@@ -5,7 +5,7 @@ from utils import fetch_naver_news, fetch_google_trends, fetch_popular_keywords
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from rag_core import ce_agent
+from workers.rag_core import ce_agent
 
 load_dotenv()
 
