@@ -12,4 +12,7 @@ keywords/*.json
 .vscode/
 .idea/
 
+qdrant_data/
+
 PROJECT_STRUCTURE.md
+project_roadmap.md
