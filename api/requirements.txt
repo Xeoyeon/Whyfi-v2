@@ -13,3 +13,7 @@ pytrends
 selenium==4.28.1
 webdriver_manager==4.0.2
 qdrant-client==1.17.1
+beautifulsoup4==4.14.3
+langchain-qdrant==1.1.0
+lxml==6.1.0
+langchain_text_splitters==1.1.2
