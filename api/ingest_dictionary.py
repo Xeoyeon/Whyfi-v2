@@ -1,58 +1,155 @@
 import os
 import time
+import hashlib
+import uuid
+import logging
+from datetime import datetime, timezone
 import wikipedia
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
+from transformers import AutoTokenizer
+
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION_NAME = "finance_dictionary"
+BATCH_SIZE = 20
 
 embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3") #for token counting
 
-def get_existing_terms(client, collection_name):
+
+def load_existing_terms(client, collection_name):
     existing_terms = set()
     try:
         client.get_collection(collection_name)
-
-        records, _ = client.scroll(
-            collection_name=collection_name,
-            limit=10000, 
-            with_payload=True,
-            with_vectors=False # without vectors to speed up the scroll
-        )
+        offset = None
         
-        for record in records:
-            metadata = record.payload.get('metadata', {})
-            term = metadata.get('term')
-            if term:
-                existing_terms.add(term)
-        print(f"Found {len(existing_terms)} existing terms in the collection.")
+        while True:
+            records, offset = client.scroll(
+                collection_name=collection_name,
+                limit=5000,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False # without vectors to speed up the scroll
+            )
+            
+            for record in records:
+                term = record.payload.get('metadata', {}).get('term')
+                if term:
+                    existing_terms.add(term)
+                    
+            if offset is None:
+                break
+            
+        logger.info(f"Fetched {len(existing_terms)} existing terms from collection '{collection_name}'.")
         
     except Exception as e:
-        print(f"Collection '{collection_name}' does not exist or error occurred: {e}")
+        logger.error(f"Collection '{collection_name}' does not exist or error occurred: {e}")
         
     return existing_terms
 
 
-def collect_finance_terms(existing_terms):
-    print("Collecting finance terms in Wikipedia's 'Glossary of finance'...")
+def _fetch_term_data(term, clean_term):
+    try:
+        summary = wikipedia.summary(term, sentences=5)
+        url_term=term.replace(" ", "_")
+        wiki_link=f"https://en.wikipedia.org/wiki/{url_term}" 
+        time.sleep(0.5)
+        
+        return{
+            "term": clean_term,
+            "content": summary,
+            "url": wiki_link,
+            "status": "success",
+            "original_term": term
+        }
+        
+    except ValueError as e:
+        time.sleep(2)
+        return {"term": term, "status": "error", "error": "API Response Error"}
+    except wikipedia.exceptions.PageError:
+        return {"term": term, "status": "error", "error": "Page Not Found"}
+    except Exception as e:
+        return {"term": term, "status": "error", "error": str(e)}
+     
+
+def chunk_and_upsert_batch(qdrant_client, batch_data):
+    if not batch_data:
+        logger.info("No new terms to process and upload.")
+        return
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, 
+        chunk_overlap=50,
+        separators=["\n\n", "\n", ". ", " ", ""] 
+    )
+    
+    documents, metadata, chunk_ids =[], [], []
+    
+    for item in batch_data:
+        if not item.get('content'):
+            continue
+        
+        clean_content = item['content'].strip()
+        chunks = text_splitter.split_text(clean_content)
+        document_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, item['term']))
+        
+        for idx, chunk in enumerate(chunks):
+            documents.append(chunk)
+            
+            metadata.append({
+                "term": item['term'],
+                "document_id": document_id,
+                "source": "Wikipedia",
+                "link":item.get('url'),
+                "type": "dictionary",
+                "char_length": len(chunk),
+                "token_count": len(tokenizer.encode(chunk)),
+                "content_hash": hashlib.md5(chunk.encode()).hexdigest(),
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+            
+            chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item['term']}_chunk_{idx}"))
+            chunk_ids.append(chunk_uuid)
+            
+    vector_store = QdrantVectorStore(
+        client=qdrant_client,
+        collection_name=COLLECTION_NAME,
+        embedding=embeddings
+    )
+    vector_store.add_texts(documents, metadatas=metadata, ids=chunk_ids)
+    
+    logger.info(f"[batch] Uploaded {len(documents)} chunks for {len(batch_data)} terms to Qdrant collection '{COLLECTION_NAME}'.")
+  
+  
+def run_ingestion_pipeline(qdrant_client,existing_terms):
+    logger.info("Starting term collection from Wikipedia...")
     wikipedia.set_lang("en")
     
     try :
-        glossary_page = wikipedia.page("Glossary of finance")
-        all_terms= glossary_page.links
+        all_terms= wikipedia.page("Glossary of finance").links
     except Exception as e:
-        print(f"Error fetching glossary page: {e}")
-        return []
+        logger.error(f"Error fetching 'Glossary of finance' page: {e}")
+        return
     
-    collected_data = []
-    invalid_keywords = ["List of", "Glossary", "Index of", "Outline of", "Timeline of", "History of", "Category:", "Portal:", "Help:", "Special:", "Portal:","disambiguation"]
-    #target_terms = all_terms[:30] #for test
+    invalid_keywords = [
+        "List of", "Glossary", "Index of", "Outline of", "Timeline of", "History of", 
+        "Category:", "Portal:", "Help:", "Special:", "disambiguation"
+    ]
     
-    for term in tqdm(all_terms, desc="Processing terms", unit="term"):
+    target_terms = []
+    for term in all_terms:
         # filter out irrelevant terms based on keywords and length
         if any(keyword in term for keyword in invalid_keywords):
             continue
@@ -62,74 +159,39 @@ def collect_finance_terms(existing_terms):
         clean_term = term.split('(')[0].strip()
         
         if clean_term in existing_terms:
-            print(f"Skipping existing term: {clean_term}")
             continue
-        
-        try:
-            summary = wikipedia.summary(term, sentences=5)
-            url_term=term.replace(" ", "_")
-            wiki_link=f"https://en.wikipedia.org/wiki/{url_term}"
-            collected_data.append({
-                "term": clean_term,
-                "content": summary,
-                "url": wiki_link
-            })
-            print(f"✅Collected data for term: {term}")
-            time.sleep(0.5)
-        except ValueError as e:
-            print(f"API Server response error for term '{term}': {e}")
-            time.sleep(2)   
-        except wikipedia.exceptions.DisambiguationError as e:
-            print(f"Disambiguation error for term '{term}': {e}")
-        except wikipedia.exceptions.PageError as e:
-            print(f"Page not found for term '{term}': {e}")
-        except Exception as e:
-            print(f"Error collecting data for term '{term}': {e}")
+        target_terms.append((term, clean_term))
+    
+    logger.info(f"Number of new terms to collect: {len(target_terms)}")
+    
+    # Use ThreadPoolExecutor to fetch term data concurrently
+    batch_data=[]
+    total_success_count=0
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_term_data, t[0], t[1]): t for t in target_terms}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="data scraping", unit="term"):
+            result = future.result()
             
-    return collected_data
-        
+            if result["status"] == "success":
+                batch_data.append(result)
+                total_success_count += 1
+            else:
+                logger.warning(f"Failed to fetch data for term '{result['term']}': {result.get('error')}")
+            
+            if len(batch_data) >= BATCH_SIZE:
+                chunk_and_upsert_batch(qdrant_client, batch_data)
+                batch_data.clear()
+    if batch_data:
+        chunk_and_upsert_batch(qdrant_client, batch_data)
+        batch_data.clear()
+    
+    logger.info(f"Successfully collected data for {total_success_count} terms.")
 
-def preprocess_and_upload(raw_data):
-    if not raw_data:
-        print("No data to preprocess and upload.")
-        return
-    
-    print(f"Preprocessing {len(raw_data)} new terms and uploading to Qdrant...")
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500, 
-        chunk_overlap=50,
-        separators=["\n\n", "\n", ". ", " ", ""] 
-    )
-    
-    documents=[]
-    metadata=[]
-    
-    for item in raw_data:
-        if not item.get('content'):
-            continue
-        clean_content = item['content'].strip()
-        chunks = text_splitter.split_text(clean_content)
-        
-        for chunk in chunks:
-            documents.append(chunk)
-            metadata.append({
-                "term": item['term'],
-                "source": "Wikipedia",
-                "link":item.get('url'),
-                "type": "dictionary"
-            })
-    
-    qdrant_client = QdrantClient(url=QDRANT_URL)
-    vector_store = QdrantVectorStore(
-        client=qdrant_client,
-        collection_name=COLLECTION_NAME,
-        embedding=embeddings
-    )
-    vector_store.add_texts(documents, metadatas=metadata)
-    print("<Finance_dictionary> Data uploaded to Qdrant successfully.")
+
     
 if __name__ == "__main__":
-    client = QdrantClient(url=QDRANT_URL)
-    existing_terms = get_existing_terms(client, COLLECTION_NAME)
-    data = collect_finance_terms(existing_terms)
-    preprocess_and_upload(data)
+    qdrant_client = QdrantClient(url=QDRANT_URL)
+    existing_terms = load_existing_terms(qdrant_client, COLLECTION_NAME)
+    run_ingestion_pipeline(existing_terms)
+    logger.info("Term collection and upload process completed.")
+    
