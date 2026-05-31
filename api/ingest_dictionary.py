@@ -38,7 +38,18 @@ WIKI_SOURCE_PAGES = [
     page.strip()
     for page in os.getenv(
         "WIKI_SOURCE_PAGES",
-        "Outline of finance|Glossary of stock market terms"
+        "|".join([
+            "Outline of finance",
+            "Glossary of stock market terms",
+            "Glossary of economics",
+            "Outline of economics",
+            "Outline of accounting",
+            "Financial market",
+            "Stock market",
+            "Investment",
+            "Money market",
+            "Financial system",
+        ])
     ).split("|")
     if page.strip()
 ]
