@@ -15,6 +15,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from transformers import AutoTokenizer
+from observability.metrics import IngestionMetrics, TimedEmbeddings
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -220,6 +221,31 @@ def normalize_term(term):
     return term
 
 
+def term_key(term):
+    return normalize_term(term).casefold()
+
+
+def normalize_chunks(chunks):
+    normalized_chunks = []
+
+    for raw_chunk in chunks:
+        chunk = re.sub(r"\s+", " ", raw_chunk or "").strip()
+        if not chunk:
+            continue
+
+        leading_punctuation = re.match(r"^([.!?]+)(?!\d)\s*(.*)$", chunk)
+        if leading_punctuation:
+            punctuation, remainder = leading_punctuation.groups()
+            if normalized_chunks and not normalized_chunks[-1].endswith(tuple(".!?")):
+                normalized_chunks[-1] = f"{normalized_chunks[-1]}{punctuation}"
+            chunk = remainder.strip()
+
+        if chunk:
+            normalized_chunks.append(chunk)
+
+    return normalized_chunks
+
+
 def load_existing_terms(client, collection_name):
     existing_terms = set()
     try:
@@ -279,9 +305,13 @@ def _fetch_term_data(term, clean_term):
             "content": summary,
             "url": page.get("content_urls", {}).get("desktop", {}).get("page"),
             "status": "success",
-            "original_term": term
+            "original_term": term,
+            "fetch_elapsed": elapsed,
+            "slow_fetch": elapsed >= SLOW_FETCH_SECONDS,
         }
         
+    except requests.exceptions.Timeout:
+        return {"term": clean_term, "status": "error", "error": "Timeout"}
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else "unknown"
         return {"term": clean_term, "status": "error", "error": f"HTTP {status_code}"}
@@ -292,7 +322,7 @@ def _fetch_term_data(term, clean_term):
         return {"term": clean_term, "status": "error", "error": str(e)}
      
 
-def chunk_and_upsert_batch(vector_store, batch_data):
+def chunk_and_upsert_batch(vector_store, batch_data, metrics=None):
     if not batch_data:
         logger.info("No new terms to process and upload.")
         return
@@ -307,7 +337,7 @@ def chunk_and_upsert_batch(vector_store, batch_data):
             continue
         
         clean_content = item['content'].strip()
-        chunks = text_splitter.split_text(clean_content)
+        chunks = normalize_chunks(text_splitter.split_text(clean_content))
         
         for idx, chunk in enumerate(chunks):
             documents.append(chunk)
@@ -342,11 +372,23 @@ def chunk_and_upsert_batch(vector_store, batch_data):
     for start in range(0, len(documents), UPLOAD_CHUNK_SIZE):
         end = start + UPLOAD_CHUNK_SIZE
         logger.info(f"[batch] Uploading chunks {start + 1}-{min(end, len(documents))} of {len(documents)}.")
+        upload_started_at = time.monotonic()
+        embedding_before = metrics.embedding_seconds if metrics else 0.0
         vector_store.add_texts(
             documents[start:end],
             metadatas=metadata[start:end],
             ids=chunk_ids[start:end]
         )
+        upload_elapsed = time.monotonic() - upload_started_at
+        embedding_elapsed = (metrics.embedding_seconds - embedding_before) if metrics else 0.0
+        logger.info(f"[batch] Upload chunk finished in {upload_elapsed:.1f}s.")
+
+        if metrics:
+            metrics.record_batch_upload_time(upload_elapsed)
+            metrics.record_qdrant_upload_time(upload_elapsed - embedding_elapsed)
+
+    if metrics:
+        metrics.record_uploaded_chunks(len(documents))
     
     logger.info(f"[batch] Uploaded {len(documents)} chunks for {len(batch_data)} terms to Qdrant collection '{COLLECTION_NAME}'.")
   
@@ -371,6 +413,7 @@ def _log_slow_futures(in_flight):
 
 
 def run_ingestion_pipeline(qdrant_client, existing_terms):
+    metrics = IngestionMetrics()
     logger.info("Starting term collection from Wikipedia...")
     logger.info(
         "Runtime settings: "
@@ -383,6 +426,7 @@ def run_ingestion_pipeline(qdrant_client, existing_terms):
         all_terms = fetch_glossary_links()
     except Exception as e:
         logger.exception(f"Error fetching Wikipedia source pages: {e}")
+        metrics.log_summary()
         return
     
     invalid_keywords = [
@@ -413,11 +457,11 @@ def run_ingestion_pipeline(qdrant_client, existing_terms):
     logger.info(f"Number of new terms to collect: {len(new_terms)}")
     if not new_terms:
         logger.info("No new terms to fetch.")
+        metrics.log_summary()
         return
     
     # Use ThreadPoolExecutor to fetch term data concurrently
     batch_data=[]
-    total_success_count=0
 
     def submit_next_term(executor, term_iter, in_flight):
         try:
@@ -461,6 +505,7 @@ def run_ingestion_pipeline(qdrant_client, existing_terms):
                         result = future.result()
                     except Exception:
                         logger.exception(f"Unexpected fetch error for term '{future_info['term']}'.")
+                        metrics.record_failure("Unexpected fetch error")
                         submit_next_term(executor, term_iter, in_flight)
                         continue
             
@@ -470,9 +515,11 @@ def run_ingestion_pipeline(qdrant_client, existing_terms):
                             continue
                         batch_data.append(result)
                         existing_terms.add(result["term_key"])
-                        total_success_count += 1
+                        metrics.record_success(slow_fetch=result.get("slow_fetch", False))
                     else:
-                        logger.warning(f"Failed to fetch data for term '{result['term']}': {result.get('error')}")
+                        error_reason = result.get("error")
+                        metrics.record_failure(error_reason)
+                        logger.warning(f"Failed to fetch data for term '{result['term']}': {error_reason}")
 
                     if len(batch_data) >= BATCH_SIZE:
                         try:
@@ -480,17 +527,19 @@ def run_ingestion_pipeline(qdrant_client, existing_terms):
                                 vector_store = QdrantVectorStore(
                                     client=qdrant_client,
                                     collection_name=COLLECTION_NAME,
-                                    embedding=get_embeddings()
+                                    embedding=TimedEmbeddings(get_embeddings(), metrics)
                                 )
-                            chunk_and_upsert_batch(vector_store, batch_data)
+                            chunk_and_upsert_batch(vector_store, batch_data, metrics)
                         except MemoryError:
                             logger.exception(
                                 "Out of memory while processing a batch. "
                                 "Try lowering DICTIONARY_BATCH_SIZE or DICTIONARY_UPLOAD_CHUNK_SIZE."
                             )
+                            metrics.log_summary()
                             raise
                         except Exception:
                             logger.exception("Batch upload failed.")
+                            metrics.log_summary()
                             raise
                         finally:
                             batch_data.clear()
@@ -503,21 +552,24 @@ def run_ingestion_pipeline(qdrant_client, existing_terms):
                 vector_store = QdrantVectorStore(
                     client=qdrant_client,
                     collection_name=COLLECTION_NAME,
-                    embedding=get_embeddings()
+                    embedding=TimedEmbeddings(get_embeddings(), metrics)
                 )
-            chunk_and_upsert_batch(vector_store, batch_data)
+            chunk_and_upsert_batch(vector_store, batch_data, metrics)
         except MemoryError:
             logger.exception(
                 "Out of memory while processing the final batch. "
                 "Try lowering DICTIONARY_BATCH_SIZE or DICTIONARY_UPLOAD_CHUNK_SIZE."
             )
+            metrics.log_summary()
             raise
         except Exception:
             logger.exception("Final batch upload failed.")
+            metrics.log_summary()
             raise
         batch_data.clear()
     
-    logger.info(f"Successfully collected data for {total_success_count} terms.")
+    logger.info(f"Successfully collected data for {metrics.success_terms} terms.")
+    metrics.log_summary()
 
 
     
