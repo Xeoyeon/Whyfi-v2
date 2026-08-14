@@ -4,7 +4,6 @@ redis==5.0.0
 python-dotenv
 langchain>=0.2.0
 langchain-core>=0.2.0
-langchain-chroma
 langchain-huggingface
 langchain-google-genai
 sentence-transformers 

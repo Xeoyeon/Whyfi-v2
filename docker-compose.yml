@@ -27,6 +27,7 @@ services:
     volumes:
       - ./api:/app
       - ./utils.py:/utils.py
+      - ./workers:/workers
     environment:
       - REDIS_URL=redis://redis:6379/0
       - QDRANT_URL=http://qdrant:6333
